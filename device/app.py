@@ -4,10 +4,10 @@
 GET  /                -> the page
 POST /api/generate    -> body: one JSON line {"prompt", "mode", "image_len", "audio_len"},
                          then image_len bytes of JPEG and audio_len bytes of 16 kHz mu-law.
-                         Returns {"id", "segments", "text", "level", "heard", "tokens", "seconds", "note"};
+                         Returns {"id", "segments", "text", "level", "concern", "tokens", "seconds", "note"};
                          audio segments are [offset, length] into the answer's audio.
-                         The input is wrapped in triage instructions; "level" is RED, YELLOW,
-                         GREEN or null, and "heard" is the model's one-line summary of the voice.
+                         The input goes in with the triage instructions; "level" is RED, YELLOW,
+                         GREEN or null, and "concern" is the model's Concern line.
 GET  /api/audio/<id>  -> the answer's audio, 16 kHz mu-law
 
 Media is compact on purpose: it crosses a 921600-baud serial link. Standard library only.
@@ -22,19 +22,29 @@ AUDIO = OrderedDict()  # answer id -> mu-law bytes, last few answers only
 IDS = itertools.count(1)
 MODEL_LOCK = threading.Lock()
 
-# System prompt for every request. Kept short: the 2B model follows a few plain lines
-# better than a long brief, and the answer is spoken, so no lists or symbols.
-TRIAGE = """You are a medical triage assistant. A first responder describes a patient by voice, sometimes with notes or a photo. You support their judgement: never claim a diagnosis, and when in doubt, triage higher.
-Answer in short spoken sentences, without lists or symbols, using exactly these lines:
-Heard: what the responder said, in one line.
-Concern: the most likely problem.
-Red flags: warning signs to check right now.
-Next step: what to do now.
-TRIAGE: one word, RED, YELLOW or GREEN. RED means life-threatening now, YELLOW means needs care within hours, GREEN means minor."""
-# A TRIAGE line naming exactly one level, so an echoed "RED, YELLOW or GREEN" does not count.
-LEVEL = re.compile(r"^[^\w\n]*TRIAGE(?: level)?[^\w\n]*(RED|YELLOW|GREEN)\b"
-                   r"(?![^\n]*\b(?-i:RED|YELLOW|GREEN)\b)[^\n]*\n?", re.I | re.M)
-HEARD = re.compile(r"^[^\w\n]*Heard[^\w\n]*(.+)$", re.I | re.M)
+# Triage instructions, sent as text in the same user turn as the voice (after it), which is
+# how they were tested on the board. Without them the model restates what it was told.
+# Tested with LFM3-Omni-2B: the placeholders keep the format without being copied, an
+# example answer gets copied, and the "do not repeat" line stops the restating. The model
+# still misjudges some levels (chest pain as YELLOW), so the page raises the level to RED
+# when its fixed red-flag rules match the notes or the Concern line.
+TRIAGE = """You are a medical triage assistant for first responders. The responder describes a patient. Do not repeat, restate or summarize the description; the responder already knows it. Do not ask questions. Never claim a diagnosis.
+Reply in exactly this format, four short lines and nothing else:
+Concern: <the medical problem you suspect, in a few words>
+Check: <two or three things to check on this patient>
+Do now: <two or three first actions for this patient>
+TRIAGE: <RED or YELLOW or GREEN>
+RED means life-threatening now, YELLOW means needs care within hours, GREEN means minor. Anything that threatens breathing, the heart, the brain or consciousness is RED. When unsure, choose the higher level. Only advise CPR if the patient is not breathing."""
+# A TRIAGE line naming exactly one level (an echoed "RED or YELLOW or GREEN" does not count),
+# or a line that is only the level, which the model sometimes writes instead.
+LEVEL = re.compile(r"^[^\w\n]*(?:TRIAGE(?: level)?[^\w\n]*(RED|YELLOW|GREEN)\b"
+                   r"(?![^\n]*\b(?-i:RED|YELLOW|GREEN)\b)[^\n]*|(RED|YELLOW|GREEN)[^\w\n]*)$", re.I | re.M)
+CONCERN = re.compile(r"^[^\w\n]*Concern[^\w\n]*(.+)$", re.I | re.M)
+
+
+def triage_prompt(prompt):
+    """The triage instructions, then the responder's typed notes, if any."""
+    return TRIAGE + ("\n\nCase: " + prompt if prompt else "")
 
 PAGE = r"""<!doctype html>
 <html lang="en"><head><meta charset="utf-8">
@@ -157,12 +167,14 @@ document.querySelectorAll("#scenarios button").forEach(b => b.onclick = () => {
   if ("photo" in b.dataset) $("file").click(); else if (!recorder) talk();
 });
 
-// ---- red flags: fixed rules, independent of the model, on the typed notes and on what the model heard ----
+// ---- red flags: fixed rules, independent of the model's judgement, on the typed notes and the model's Concern line ----
 const RED_FLAGS = [
   ["chest pain", /chest (pain|pressure|tightness)/i],
-  ["trouble breathing", /(can'?t|cannot|unable to|struggling to|not) breath|short(ness)? of breath|choking|gasping/i],
+  ["possible heart attack", /heart attack|cardiac|myocardial|coronary|angina/i],
+  ["trouble breathing", /(can'?t|cannot|unable to|struggling to|not) breath|short(ness)? of breath|difficulty breathing|breathing difficult|respiratory (distress|failure)|airway (obstruct|block)|choking|gasping/i],
   ["unresponsive", /unconscious|unresponsive|passed out|not waking|won'?t wake/i],
-  ["severe bleeding", /(severe|heavy|uncontrolled|massive|spurting) bleed|bleeding (heavily|a lot|badly|won'?t stop)/i],
+  ["severe bleeding", /(severe|heavy|uncontrolled|massive|spurting) bleed|bleeding (heavily|a lot|badly|won'?t stop)|haemorrhag|hemorrhag/i],
+  ["sepsis", /sepsis|septic/i],
   ["stroke signs", /stroke|face (is )?droop|drooping face|slurred speech|one side (is )?(weak|numb)/i],
   ["seizure", /seizure|convuls/i],
   ["allergic reaction", /anaphyla|throat (is )?(swelling|closing|tight)|swollen (tongue|throat)/i],
@@ -176,20 +188,23 @@ function beep() {
   const ac = audioCtx(), o = ac.createOscillator(), g = ac.createGain();
   o.frequency.value = 880; g.gain.value = 0.2; o.connect(g).connect(ac.destination); o.start(); o.stop(ac.currentTime + 0.4);
 }
-function checkFlags(heard = "") {
-  const text = $("prompt").value + "\n" + heard;
+function checkFlags(concern = "") {
+  const text = $("prompt").value + "\n" + concern;
   const hits = RED_FLAGS.filter(([, re]) => re.test(text)).map(([name]) => name);
   const wasHidden = $("alarm").classList.contains("hidden");
   $("alarm").textContent = "Possible emergency: " + hits.join(", ") + ". Get emergency help now; do not wait for the assistant.";
   $("alarm").classList.toggle("hidden", !hits.length);
   if (hits.length && wasHidden) beep();
+  return hits;
 }
 $("prompt").addEventListener("input", () => checkFlags());
 
-// ---- triage level badge ----
+// ---- triage level badge: a red flag raises the model's level to RED ----
 const LEVELS = { RED: "RED: life-threatening, act now", YELLOW: "YELLOW: urgent, care within hours", GREEN: "GREEN: minor" };
-function showLevel(level) {
-  $("level").textContent = level ? "Triage " + LEVELS[level] : "No triage level in the answer";
+function showLevel(level, flagged) {
+  const raised = flagged && level !== "RED";
+  if (flagged) level = "RED";
+  $("level").textContent = level ? "Triage " + LEVELS[level] + (raised ? " (raised by red-flag rules)" : "") : "No triage level in the answer";
   $("level").className = "level " + (level ? level.toLowerCase() : "none");
 }
 $("voicePlay").onclick = () => voice && play([{ type: "audio", offset: 0, length: voice.ulaw.length }], voice.ulaw, false);
@@ -259,8 +274,8 @@ async function send() {
     $("meta").textContent = d.tokens + " tokens in " + d.seconds + " s on the device" +
       (secs ? ", " + secs.toFixed(1) + " s of speech" : "") + " | " + ((Date.now() - t0) / 1000).toFixed(1) + " s total" +
       (d.note ? " | " + d.note : "");
-    checkFlags(d.heard || "");
-    if (d.text) showLevel(d.level);
+    const flagged = checkFlags(d.concern || "").length > 0;
+    if (d.text) showLevel(d.level, flagged);
     if (mode === "audio") $("out").textContent = d.text ? "" : "(speaking)";
     if (d.audio_bytes) $("replay").classList.remove("hidden");
     $("go").disabled = $("talk").disabled = false;
@@ -284,12 +299,10 @@ def generate(meta, image, ulaw):
     start = time.time()
     with MODEL_LOCK:
         if image:
-            case = prompt or ("The responder describes the patient in the audio." if pcm
-                              else "Assess the patient in this photo.")
-            ans = omni.with_image(case, mode, image, pcm, system=TRIAGE)
+            ans = omni.with_image(triage_prompt(prompt), mode, image, pcm)
         else:
-            ans = omni.realtime(prompt, mode, pcm, system=TRIAGE)
-    level, heard = LEVEL.search(ans.text), HEARD.search(ans.text)
+            ans = omni.realtime(triage_prompt(prompt), mode, pcm)
+    levels, concern = LEVEL.findall(ans.text), CONCERN.search(ans.text)
 
     segments, audio = [], b""
     for kind, data in ans.segments:
@@ -305,7 +318,8 @@ def generate(meta, image, ulaw):
         while len(AUDIO) > 5:
             AUDIO.popitem(last=False)
     return {"id": answer_id, "segments": segments, "text": ans.text, "audio_bytes": len(audio),
-            "level": level and level.group(1).upper(), "heard": heard and heard.group(1).strip(),
+            "level": "".join(levels[-1]).upper() if levels else None,
+            "concern": concern and concern.group(1).strip(),
             "tokens": ans.tokens, "seconds": round(time.time() - start, 1), "note": ans.note}
 
 
