@@ -10,18 +10,20 @@ padding after it, because the UART holds back the tail of a burst until more byt
 It prints __R<TAG>__, then "H <base64 JSON status/headers>", the body as base64 lines,
 and "Z <sha256 of the body>".
 """
-import base64, hashlib, http.client, json, os, sys, termios, time, tty
+import base64, hashlib, http.client, json, os, select, sys, termios, time, tty
 
 
-def read_body(n, timeout=60):
-    """Read exactly n bytes from the console in raw mode, then drop the padding."""
+def read_body(n, idle=3):
+    """Read exactly n bytes from the console in raw mode, then drop the padding.
+    Gives up after `idle` seconds without input, so a relay that died mid-upload
+    does not leave the console stuck in raw mode."""
     fd = sys.stdin.fileno()
     old = termios.tcgetattr(fd)
     tty.setraw(fd)
-    data, end = b"", time.time() + timeout
+    data = b""
     try:
         print(f"READY_{TAG}", end="\r\n", flush=True)
-        while len(data) < n and time.time() < end:
+        while len(data) < n and select.select([fd], [], [], idle)[0]:
             data += os.read(fd, n - len(data))
     finally:
         time.sleep(0.2)
