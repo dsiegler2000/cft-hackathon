@@ -4,13 +4,15 @@
 GET  /                -> the page
 POST /api/generate    -> body: one JSON line {"prompt", "mode", "image_len", "audio_len"},
                          then image_len bytes of JPEG and audio_len bytes of 16 kHz mu-law.
-                         Returns {"id", "segments", "text", "tokens", "seconds", "note"};
+                         Returns {"id", "segments", "text", "level", "heard", "tokens", "seconds", "note"};
                          audio segments are [offset, length] into the answer's audio.
+                         The input is wrapped in triage instructions; "level" is RED, YELLOW,
+                         GREEN or null, and "heard" is the model's one-line summary of the voice.
 GET  /api/audio/<id>  -> the answer's audio, 16 kHz mu-law
 
 Media is compact on purpose: it crosses a 921600-baud serial link. Standard library only.
 """
-import itertools, json, threading, time
+import itertools, json, re, threading, time
 from collections import OrderedDict
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 
@@ -19,6 +21,20 @@ import omni
 AUDIO = OrderedDict()  # answer id -> mu-law bytes, last few answers only
 IDS = itertools.count(1)
 MODEL_LOCK = threading.Lock()
+
+# System prompt for every request. Kept short: the 2B model follows a few plain lines
+# better than a long brief, and the answer is spoken, so no lists or symbols.
+TRIAGE = """You are a medical triage assistant. A first responder describes a patient by voice, sometimes with notes or a photo. You support their judgement: never claim a diagnosis, and when in doubt, triage higher.
+Answer in short spoken sentences, without lists or symbols, using exactly these lines:
+Heard: what the responder said, in one line.
+Concern: the most likely problem.
+Red flags: warning signs to check right now.
+Next step: what to do now.
+TRIAGE: one word, RED, YELLOW or GREEN. RED means life-threatening now, YELLOW means needs care within hours, GREEN means minor."""
+# A TRIAGE line naming exactly one level, so an echoed "RED, YELLOW or GREEN" does not count.
+LEVEL = re.compile(r"^[^\w\n]*TRIAGE(?: level)?[^\w\n]*(RED|YELLOW|GREEN)\b"
+                   r"(?![^\n]*\b(?-i:RED|YELLOW|GREEN)\b)[^\n]*\n?", re.I | re.M)
+HEARD = re.compile(r"^[^\w\n]*Heard[^\w\n]*(.+)$", re.I | re.M)
 
 PAGE = r"""<!doctype html>
 <html lang="en"><head><meta charset="utf-8">
@@ -31,42 +47,50 @@ PAGE = r"""<!doctype html>
   main { max-width:760px; margin:0 auto; padding:32px 16px; }
   h1 { font-size:20px; margin:0 0 4px; }
   p.sub { margin:0 0 20px; color:var(--muted); font-size:14px; }
-  textarea { width:100%; box-sizing:border-box; min-height:110px; padding:12px; font:inherit;
+  textarea { width:100%; box-sizing:border-box; min-height:70px; margin-top:14px; padding:12px; font:inherit;
              background:transparent; color:inherit; border:1px solid var(--line); border-radius:8px; resize:vertical; }
   .row { display:flex; flex-wrap:wrap; gap:8px; align-items:center; margin-top:10px; }
   button, label.btn { padding:8px 14px; font:inherit; font-size:14px; border:1px solid var(--line); border-radius:8px;
            background:var(--chip); color:inherit; cursor:pointer; }
   button.primary { background:var(--accent); border-color:var(--accent); color:#fff; padding:9px 18px; }
+  button.talk { font-size:17px; padding:12px 32px; }
   button.recording { background:var(--rec); border-color:var(--rec); color:#fff; }
   button:disabled { opacity:.5; cursor:wait; }
   .chip { display:inline-flex; gap:8px; align-items:center; padding:4px 6px 4px 10px; border-radius:999px; background:var(--chip); font-size:14px; }
   .chip img { height:28px; border-radius:4px; }
   .chip button { padding:0 8px; border:0; background:transparent; }
-  fieldset { border:0; padding:0; margin:14px 0 0; display:flex; gap:16px; flex-wrap:wrap; font-size:14px; }
-  legend { color:var(--muted); font-size:13px; margin-bottom:4px; }
+  .hint { color:var(--muted); font-size:13px; }
+  .alarm { margin-top:16px; padding:10px 14px; border-radius:8px; background:var(--rec); color:#fff; font-weight:600; }
+  .level { margin-top:24px; padding:10px 16px; border-radius:8px; font-size:18px; font-weight:700; color:#fff; }
+  .level.red { background:#dc2626; } .level.yellow { background:#eab308; color:#1a1a1a; } .level.green { background:#16a34a; }
+  .level.none { background:var(--chip); color:var(--muted); font-size:14px; font-weight:400; }
+  .level:not(.hidden) + #out { margin-top:8px; }
   #out { margin-top:24px; white-space:pre-wrap; padding:16px; border:1px solid var(--line); border-radius:8px; min-height:2em; }
   #out .speaking { border-bottom:2px solid var(--accent); }
   #meta { margin-top:8px; color:var(--muted); font-size:13px; }
   .hidden { display:none !important; }
 </style></head>
 <body><main>
-  <h1>LFM3-Omni-2B</h1>
-  <p class="sub">Running on the Dragonwing IQ-9075 (llama.cpp, CPU). Ctrl/Cmd+Enter to send.</p>
-  <textarea id="prompt" placeholder="Type a prompt, record your voice, attach an image, or combine them..." autofocus></textarea>
+  <h1>Triage assistant</h1>
+  <p class="sub">Describe the patient by voice; the answer comes back spoken and written. LFM3-Omni-2B, offline on the Dragonwing IQ-9075. Decision support only, not a diagnosis.</p>
+  <div class="row"><button id="talk" type="button" class="primary talk">Talk</button><span id="cue" class="hint">Tap, describe the patient, tap again to send.</span></div>
+  <div class="row" id="scenarios"><span class="hint">Start with:</span>
+    <button type="button" data-topic="Wound" data-photo data-cue="Add a photo, then tap Talk: where it is, how big, how it happened.">Wound</button>
+    <button type="button" data-topic="Burn" data-photo data-cue="Add a photo, then tap Talk: where, how big, what caused it.">Burn</button>
+    <button type="button" data-topic="Skin rash" data-photo data-cue="Add a photo, then tap Talk: where, how long, any fever or itching.">Rash</button>
+    <button type="button" data-topic="Breathing problem" data-cue="Say how fast they breathe, any wheeze, their lip colour. Tap again to send.">Breathing</button>
+    <button type="button" data-topic="Head injury" data-cue="Say how it happened, whether they were knocked out, vomiting or confused. Tap again to send.">Head injury</button>
+  </div>
+  <textarea id="prompt" placeholder="Optional notes, typed instead of or as well as speaking. Ctrl/Cmd+Enter to send."></textarea>
   <div class="row">
-    <button id="rec" type="button">Record voice</button>
-    <label class="btn" for="file">Attach image</label>
+    <label class="btn" for="file">Add photo</label>
     <input id="file" type="file" accept="image/*" class="hidden">
     <span id="voiceChip" class="chip hidden"><span id="voiceLabel"></span><button type="button" id="voicePlay" title="Play">&#9654;</button><button type="button" id="voiceDel" title="Remove">&times;</button></span>
     <span id="imgChip" class="chip hidden"><img id="imgThumb" alt=""><span id="imgLabel"></span><button type="button" id="imgDel" title="Remove">&times;</button></span>
+    <button id="go">Send</button><button id="replay" class="hidden">Replay</button>
   </div>
-  <fieldset>
-    <legend>Response</legend>
-    <label><input type="radio" name="mode" value="text" checked> Text</label>
-    <label><input type="radio" name="mode" value="audio"> Voice</label>
-    <label><input type="radio" name="mode" value="interleaved"> Text + voice (interleaved)</label>
-  </fieldset>
-  <div class="row"><button id="go" class="primary">Send</button><button id="replay" class="hidden">Replay</button></div>
+  <div id="alarm" class="alarm hidden" role="alert"></div>
+  <div id="level" class="level hidden"></div>
   <div id="out"></div>
   <div id="meta"></div>
 <script>
@@ -97,9 +121,10 @@ function ulawDecode(u8) {
 }
 function audioCtx() { ctx = ctx || new AudioContext(); if (ctx.state === "suspended") ctx.resume(); return ctx; }
 
-// ---- voice recording: record, then resample to 16 kHz mono mu-law ----
-$("rec").onclick = async () => {
+// ---- voice: tap Talk, speak, tap again; the recording (16 kHz mono mu-law) is sent with any notes and photo ----
+async function talk() {
   if (recorder) { recorder.stop(); return; }
+  if ($("go").disabled) return;
   let stream;
   try { stream = await navigator.mediaDevices.getUserMedia({ audio: true }); }
   catch (e) { $("meta").textContent = "Microphone unavailable: " + e.message; return; }
@@ -108,7 +133,8 @@ $("rec").onclick = async () => {
   recorder.ondataavailable = e => chunks.push(e.data);
   recorder.onstop = async () => {
     stream.getTracks().forEach(t => t.stop());
-    recorder = null; $("rec").classList.remove("recording"); $("rec").textContent = "Record voice";
+    recorder = null; $("talk").classList.remove("recording"); $("talk").textContent = "Talk";
+    if (Date.now() - recStart < 600) return;  // an accidental tap, not a description
     const buf = await audioCtx().decodeAudioData(await new Blob(chunks).arrayBuffer());
     const off = new OfflineAudioContext(1, Math.ceil(buf.duration * RATE), RATE);
     const src = off.createBufferSource(); src.buffer = buf; src.connect(off.destination); src.start();
@@ -116,12 +142,56 @@ $("rec").onclick = async () => {
     voice = { ulaw: ulawEncode(pcm), seconds: buf.duration };
     $("voiceLabel").textContent = "Voice " + voice.seconds.toFixed(1) + " s";
     $("voiceChip").classList.remove("hidden");
+    send();
   };
   recorder.start(); recStart = Date.now();
-  $("rec").classList.add("recording");
-  const tick = () => { if (!recorder) return; $("rec").textContent = "Stop (" + ((Date.now() - recStart) / 1000).toFixed(0) + " s)"; setTimeout(tick, 250); };
+  $("talk").classList.add("recording");
+  const tick = () => { if (!recorder) return; $("talk").textContent = "Stop and send (" + ((Date.now() - recStart) / 1000).toFixed(0) + " s)"; setTimeout(tick, 250); };
   tick();
-};
+}
+$("talk").onclick = talk;
+
+// ---- scenario buttons: name the case and say what to describe ----
+document.querySelectorAll("#scenarios button").forEach(b => b.onclick = () => {
+  $("prompt").value = b.dataset.topic + ". "; $("cue").textContent = b.dataset.cue; checkFlags();
+  if ("photo" in b.dataset) $("file").click(); else if (!recorder) talk();
+});
+
+// ---- red flags: fixed rules, independent of the model, on the typed notes and on what the model heard ----
+const RED_FLAGS = [
+  ["chest pain", /chest (pain|pressure|tightness)/i],
+  ["trouble breathing", /(can'?t|cannot|unable to|struggling to|not) breath|short(ness)? of breath|choking|gasping/i],
+  ["unresponsive", /unconscious|unresponsive|passed out|not waking|won'?t wake/i],
+  ["severe bleeding", /(severe|heavy|uncontrolled|massive|spurting) bleed|bleeding (heavily|a lot|badly|won'?t stop)/i],
+  ["stroke signs", /stroke|face (is )?droop|drooping face|slurred speech|one side (is )?(weak|numb)/i],
+  ["seizure", /seizure|convuls/i],
+  ["allergic reaction", /anaphyla|throat (is )?(swelling|closing|tight)|swollen (tongue|throat)/i],
+  ["blue lips or skin", /blue (lips|skin|face)|cyano/i],
+  ["no pulse", /no pulse|cardiac arrest|heart (has )?stopped/i],
+  ["overdose", /overdos/i],
+  ["self-harm risk", /suicid|kill (myself|himself|herself|themsel)/i],
+  ["sudden severe headache", /worst headache|thunderclap/i],
+];
+function beep() {
+  const ac = audioCtx(), o = ac.createOscillator(), g = ac.createGain();
+  o.frequency.value = 880; g.gain.value = 0.2; o.connect(g).connect(ac.destination); o.start(); o.stop(ac.currentTime + 0.4);
+}
+function checkFlags(heard = "") {
+  const text = $("prompt").value + "\n" + heard;
+  const hits = RED_FLAGS.filter(([, re]) => re.test(text)).map(([name]) => name);
+  const wasHidden = $("alarm").classList.contains("hidden");
+  $("alarm").textContent = "Possible emergency: " + hits.join(", ") + ". Get emergency help now; do not wait for the assistant.";
+  $("alarm").classList.toggle("hidden", !hits.length);
+  if (hits.length && wasHidden) beep();
+}
+$("prompt").addEventListener("input", () => checkFlags());
+
+// ---- triage level badge ----
+const LEVELS = { RED: "RED: life-threatening, act now", YELLOW: "YELLOW: urgent, care within hours", GREEN: "GREEN: minor" };
+function showLevel(level) {
+  $("level").textContent = level ? "Triage " + LEVELS[level] : "No triage level in the answer";
+  $("level").className = "level " + (level ? level.toLowerCase() : "none");
+}
 $("voicePlay").onclick = () => voice && play([{ type: "audio", offset: 0, length: voice.ulaw.length }], voice.ulaw, false);
 $("voiceDel").onclick = () => { voice = null; $("voiceChip").classList.add("hidden"); };
 
@@ -163,11 +233,13 @@ $("replay").onclick = () => last && play(last.segments, last.ulaw, last.mode !==
 
 // ---- send ----
 async function send() {
+  if (recorder) return recorder.stop();  // Send while talking: finish the recording, which sends
   const prompt = $("prompt").value.trim();
   if (!prompt && !voice && !image) return;
-  const mode = document.querySelector("input[name=mode]:checked").value;
-  audioCtx(); playing = null;
-  $("go").disabled = true; $("replay").classList.add("hidden"); $("meta").textContent = "";
+  if ($("go").disabled) return;
+  const mode = "interleaved";  // answers are always spoken and written
+  audioCtx(); playing = null; checkFlags();
+  $("go").disabled = $("talk").disabled = true; $("replay").classList.add("hidden"); $("level").classList.add("hidden"); $("meta").textContent = "";
   $("out").textContent = (voice || image) ? "Sending media to the device and generating..." : "Generating on the device...";
   const t0 = Date.now();
   try {
@@ -187,14 +259,16 @@ async function send() {
     $("meta").textContent = d.tokens + " tokens in " + d.seconds + " s on the device" +
       (secs ? ", " + secs.toFixed(1) + " s of speech" : "") + " | " + ((Date.now() - t0) / 1000).toFixed(1) + " s total" +
       (d.note ? " | " + d.note : "");
+    checkFlags(d.heard || "");
+    if (d.text) showLevel(d.level);
     if (mode === "audio") $("out").textContent = d.text ? "" : "(speaking)";
     if (d.audio_bytes) $("replay").classList.remove("hidden");
-    $("go").disabled = false;
+    $("go").disabled = $("talk").disabled = false;
     if (!d.segments.length) $("out").textContent = "(empty response)";
     else await play(d.segments, ulaw, mode !== "audio");
   } catch (e) {
     $("out").textContent = "Error: " + e.message;
-  } finally { $("go").disabled = false; }
+  } finally { $("go").disabled = $("talk").disabled = false; }
 }
 $("go").onclick = send;
 $("prompt").addEventListener("keydown", e => { if (e.key === "Enter" && (e.metaKey || e.ctrlKey)) send(); });
@@ -210,9 +284,12 @@ def generate(meta, image, ulaw):
     start = time.time()
     with MODEL_LOCK:
         if image:
-            ans = omni.with_image(prompt, mode, image, pcm)
+            case = prompt or ("The responder describes the patient in the audio." if pcm
+                              else "Assess the patient in this photo.")
+            ans = omni.with_image(case, mode, image, pcm, system=TRIAGE)
         else:
-            ans = omni.realtime(prompt, mode, pcm)
+            ans = omni.realtime(prompt, mode, pcm, system=TRIAGE)
+    level, heard = LEVEL.search(ans.text), HEARD.search(ans.text)
 
     segments, audio = [], b""
     for kind, data in ans.segments:
@@ -228,6 +305,7 @@ def generate(meta, image, ulaw):
         while len(AUDIO) > 5:
             AUDIO.popitem(last=False)
     return {"id": answer_id, "segments": segments, "text": ans.text, "audio_bytes": len(audio),
+            "level": level and level.group(1).upper(), "heard": heard and heard.group(1).strip(),
             "tokens": ans.tokens, "seconds": round(time.time() - start, 1), "note": ans.note}
 
 
