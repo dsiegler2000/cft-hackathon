@@ -130,21 +130,18 @@ class Answer:
         return "".join(d for k, d in self.segments if k == "text").strip()
 
 
-def realtime(prompt, mode, pcm=None, pcm_rate=WIRE_RATE, system=None):
-    """Text and/or voice in, answer in `mode` (text, audio or interleaved). `system` becomes
-    the session instructions, which the server places after the model's own speech prompt."""
+def realtime(prompt, mode, pcm=None, pcm_rate=WIRE_RATE):
+    """Text and/or voice in, answer in `mode` (text, audio or interleaved)."""
     ws = WebSocket("/v1/realtime")
     try:
         created = ws.recv()
         if created.get("type") == "error":
             raise RuntimeError(created["error"]["message"])
         out_rate = created["session"]["audio"]["output"]["format"]["rate"]
-        session = {"type": "realtime", "output_modalities": MODALITIES[mode],
-                   "max_output_tokens": MAX_OUTPUT_TOKENS,
-                   "audio": {"input": {"format": {"type": "audio/pcm", "rate": pcm_rate}}}}
-        if system:
-            session["instructions"] = system
-        ws.send({"type": "session.update", "session": session})
+        ws.send({"type": "session.update", "session": {
+            "type": "realtime", "output_modalities": MODALITIES[mode],
+            "max_output_tokens": MAX_OUTPUT_TOKENS,
+            "audio": {"input": {"format": {"type": "audio/pcm", "rate": pcm_rate}}}}})
         if pcm:
             step = pcm_rate * 2  # one second per chunk
             for i in range(0, len(pcm), step):
@@ -188,7 +185,7 @@ def speak(text):
     return data, rate
 
 
-def with_image(prompt, mode, jpeg, pcm=None, pcm_rate=WIRE_RATE, system=None):
+def with_image(prompt, mode, jpeg, pcm=None, pcm_rate=WIRE_RATE):
     """Image (plus optional text and voice) in. The model answers in text; speech modes
     then read that answer aloud with /tts, since chat completions cannot return audio."""
     content = [{"type": "image_url", "image_url": {
@@ -198,9 +195,8 @@ def with_image(prompt, mode, jpeg, pcm=None, pcm_rate=WIRE_RATE, system=None):
             "data": base64.b64encode(wav(pcm, pcm_rate)).decode(), "format": "wav"}})
     content.append({"type": "text", "text": prompt or (
         "Answer the question in the audio about this image." if pcm else "Describe this image.")})
-    messages = [{"role": "system", "content": system}] if system else []
-    messages.append({"role": "user", "content": content})
-    data, _ = _post("/v1/chat/completions", {"messages": messages, "max_tokens": 512, "stream": False})
+    data, _ = _post("/v1/chat/completions", {
+        "messages": [{"role": "user", "content": content}], "max_tokens": 512, "stream": False})
     d = json.loads(data)
     text = (d["choices"][0]["message"].get("content") or "").strip()
 
